@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+
+# Author: Pooya Moradi
+# Date: 2022-03-10
+# License: MIT
+# Description: A simple client for flightradar24.com. Shows info of aircrafts
+#              flying overhead in a [latitude ± δ, longitude ± δ] vicinity
+# Dependencies: jq, curl, notify-send
+# Note: depends on 'nominatim.openstreetmap.org' for geolocation service
+
+version=0.23
+log_level=3
+use_notify=0
+brief_mode=0
+latitude=""
+longitude=""
+delta_deg=""
+lat1=""
+lon1=""
+lat2=""
+lon2=""
+bounds=""
+custom_bounds=""
+flight_ids=""
+mode=""
+details_file_tmp=""
+curl_opts=()
+script_tmp_dir=$(mktemp -d "flyover-tmp-XXX" -p "")
+# clean up temporary variables and directories
+trap 'cleanup' EXIT
+
+print_help() {
+    cat << 'END_HEREDOC'
+DESCRIPTION
+    A simple client for flightradar24.com. Shows info of aircrafts flying
+    overhead in a [latitude ± δ, longitude ± δ] vicinity
+
+USAGE: flyover [OPTIONS]
+OPTIONS
+      [-s search_str]
+        Search for city/region/place
+        Use quotes for multi-word queries
+      [-y latitude]
+        Negative for south of equator and positive for north of equator
+        Range: -90 <= latitude[float] <= +90
+      [-x longitude]
+        Negative for west of Prime Meridian and positive for east of Prime Meridian
+        Range: -180 <= longitude[float] <= +180
+      [-b bounds]
+        Geographic bounds of the region of interest
+        Format (comma-separated): "lat1,lon1,lat2,lon2"
+      [-i flight_ids]
+        flightradar24 flight_ids as a comma-separated list
+        In this mode, only the corresponding flight details are queried
+        Note: id is flightradar24's internal id (not ICAO or other standards)
+        Format example: "id1,id2,id3"
+      [-r delta_deg]
+        δ in degrees in scan square : [latitude ± δ, longitude ± δ]
+        Note: 1° of latitude ≈ 111 km
+        Range: r[float] > 0
+      [-o /path/to/detailed_flights]
+        Set output path for detailed info of flights (json array)
+        (implies 'detailed' mode)
+      [-n]
+        Use notification (implies 'detailed' mode)
+      [-f]
+        Set mode to 'brief', only print an augmented json
+      [-v log_level]
+        v = 0 : No logs. Equivalent to -q
+        v = 1 : Set level to error
+        v = 2 : Set level to warn
+        v = 3 : Set level to info (default)
+        v = 4 : Set level to debug
+      [-q]
+        Set log level to v = 0
+      [-V]
+        Print version
+      [-h]
+        Print help message
+
+NOTES
+    - latitude/longitude should be input in decimal degrees (not DMS)
+    - Either use -s (geolocation service) OR (-y,-x) but NOT both
+    - Default mode of operation is 'detailed'
+
+EXAMPLES
+    flyover -s "deylaman" -r 2
+    flyover -s "قلعه گبری" -r 0.5 -n -v4
+    flyover -y "-27.115" -x "-109.395" -r 24.15 -o /tmp/detailed.json
+    flyover -s "深圳" -qf
+    flyover -i "2b1abd2f,2b1cae23"
+    flyover -b "43.58,58.72,46.58,61.72"
+END_HEREDOC
+}
+
+cleanup() {
+    rm -rf "$script_tmp_dir"
+}
+
+log() {
+    local mode
+    case "$1" in
+        "debug")
+            mode="debug"
+            ((log_level < 4)) && return
+            ;;
+        "info")
+            mode="info"
+            ((log_level < 3)) && return
+            ;;
+        "warn")
+            mode="warn"
+            ((log_level < 2)) && return
+            ;;
+        "error")
+            mode="error"
+            ((log_level < 1)) && return
+            ;;
+    esac
+    printf >&2 "[%-5s] %s\n" "$mode" "$2"
+}
+
+fetch() {
+    local url="$1"
+    if ! curl --silent --fail --retry-connrefused --retry 3 \
+        "${curl_opts[@]}" \
+        --get "$url"; then
+        return 1
+    fi
+}
+
+sanitize_latlon() {
+    local latitude="$1"
+    local longitude="$2"
+    if jq -e -n "$latitude < -90 or $latitude > 90 or \
+        $longitude < -180 or $longitude > 180" > /dev/null; then
+        log error "Bad usage! latitude/longitude out of range"
+        return 2
+    fi
+    #remove +- signs from numbers
+    if ! printf "%f %f\n" "$latitude" "$longitude"; then
+        log error "Bad usage! latitude/longitude are invalid numbers"
+        return 2
+    fi
+}
+
+sanitize() {
+    local result
+
+    if ((use_notify)) || [[ -n $details_file ]]; then
+        brief_mode=0
+    fi
+
+    if ((brief_mode)); then
+        log debug "Mode is set to 'brief'"
+    else
+        log debug "Mode is set to 'detailed'"
+    fi
+
+    if [[ -n "$flight_ids" ]]; then
+        if [[ -n "$latitude" || -n "$longitude" || -n "$query_str" ||
+            -n "$delta_deg" ]]; then
+            log warn "Ignoring search_city/latitude/longitude/delta_deg/bounds"
+        fi
+        mode="direct-ids"
+        return 0
+    fi
+
+    if [[ -n "$bounds" ]]; then
+        if [[ -n "$latitude" || -n "$longitude" || -n "$query_str" ||
+            -n "$delta_deg" ]]; then
+            log warn "Ignoring search_city/latitude/longitude/delta_deg."
+        fi
+        mode="scan_bounds"
+        # remove all whilespaces from the list
+        bounds="${bounds//[[:space:]]/}"
+        IFS="," read -r lat1 lon1 lat2 lon2 <<< "$bounds"
+        if [[ -z "$lat1" || -z "$lon1" || -z "$lat2" || -z "$lon2" ]]; then
+            log error "Bad usage! lat1/lon1/lat2/lon2 are not given"
+            return 2
+        fi
+        if ! result="$(sanitize_latlon "$lat1" "$lon1")"; then
+            return 2
+        fi
+        read -r lat1 lon1 <<< "$result"
+        if ! result="$(sanitize_latlon "$lat2" "$lon2")"; then
+            return 2
+        fi
+        read -r lat2 lon2 <<< "$result"
+
+        return 0
+    fi
+    if [[ -n "$query_str" ]]; then
+        if [[ -n "$latitude" || -n "$longitude" ]]; then
+            log warn "Ignoring latitude/longitude"
+        fi
+        if ! result="$(geolocate "$query_str")"; then
+            return 2
+        fi
+        read -r latitude longitude <<< "$result"
+    else
+        if [[ -z "$latitude" || -z "$longitude" ]]; then
+            log error "latitude/longitude is not provided"
+            return 2
+        fi
+        if ! result="$(sanitize_latlon "$latitude" "$longitude")"; then
+            return 2
+        fi
+        read -r latitude longitude <<< "$result"
+    fi
+
+    if [[ -z "$delta_deg" ]]; then
+        log info "Using default r: δ = 1°"
+        delta_deg=1
+    else
+        if ! jq -e -n "$delta_deg > 0" > /dev/null; then
+            log error "Bad usage! delta_deg invalid or out of range"
+            return 2
+        fi
+    fi
+    mode="scan_bounds"
+    return 0
+}
+
+geolocate() {
+    local query="$1"
+    local latitude longitude
+    local response
+    local endpoint="https://nominatim.openstreetmap.org"
+    curl_opts=()
+    curl_opts+=(--data-urlencode "q=$query")
+    curl_opts+=(--data-urlencode "format=json")
+    if ! response=$(fetch \
+        "$endpoint/search"); then
+        log error "Problem in connecting to $endpoint"
+        return 1
+    fi
+    log info "Match found: $(jq '.[0].display_name' <<< "$response")"
+    read -r latitude longitude < \
+        <(jq -r '.[0] | .lat + " " + .lon' <<< "$response")
+    if [[ -z "$latitude" || -z "$longitude" ]]; then
+        log error "No match was found for : $query"
+        return 1
+    fi
+    log info "'$query' WGS84 coordinates at latitude=$latitude, longitude=$longitude"
+    printf "%s %s\n" "$latitude" "$longitude"
+}
+
+get_flights() {
+    local bounds="$1"
+    local endpoint="https://data-cloud.flightradar24.com"
+    local config="faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=1&air=1&\
+vehicles=1&estimated=1&maxage=14400&gliders=1&stats=1"
+    curl_opts=()
+    local response
+    if ! response=$(fetch \
+        "$endpoint/zones/fcgi/feed.js?$config&bounds=$bounds"); then
+        log error "Problem in connecting to $endpoint"
+        return 1
+    fi
+    printf "%s\n" "$response"
+}
+
+generate_bounds() {
+    local delta="$1"
+    local latitude="$2"
+    local longitude="$3"
+    local y1 y2 x1 x2
+    if ! { read -r y1 && read -r x1 && read -r y2 && read -r x2; } < \
+        <(
+            bc --quiet --standard --warn <<< \
+                "scale=10;
+            $latitude-$delta;
+            $longitude-$delta;
+            $latitude+$delta;
+            $longitude+$delta;
+            "
+        ); then
+        return 1
+    fi
+    # note the bound order required for flightradar24
+    printf "%f,%f,%f,%f\n" "$y2" "$y1" "$x1" "$x2"
+}
+
+get_flight_details() {
+    local id="$1"
+    local endpoint="https://data-live.flightradar24.com"
+    local response
+    curl_opts=()
+    if ! response=$(fetch \
+        "$endpoint/clickhandler/?version=1.5&flight=$id"); then
+        log error "Problem in connecting to $endpoint"
+        return 1
+    fi
+    printf "%s\n" "$response"
+}
+
+filter_flights() {
+    local flights="$1"
+    local latitude="$2"
+    local longitude="$3"
+    local delta_deg="$4"
+    local filter="
+        del(.[] | arrays | select(
+            pow(.[1] - \$lat ; 2) > pow(\$delta; 2) or
+            pow(.[2] - \$lon ; 2) > pow(\$delta; 2)))
+    "
+    jq --argjson lat "$latitude" --argjson lon "$longitude" \
+        --argjson delta "$delta_deg" \
+        "$filter" \
+        <<< "$flights"
+}
+
+# Augments the output of get_flights (brief json) with explanatory keys
+# The correspondence of array elements assignment is based on:
+# https://github.com/JeanExtreme002/FlightRadarAPI/blob/main/python/FlightRadar24/entities/flight.py
+gen_brief() {
+    local brief="$1"
+    jq '
+. as $x 
+| (del (.stats, .version, .full_count)) as $y 
+| [($y | keys[] as $id
+| {
+    "id"             : $id,
+    "icao_hex"       : $y.[$id][0],
+    "lat"            : $y.[$id][1],
+    "lng"            : $y.[$id][2],
+    "hd"             : $y.[$id][3],
+    "alt"            : $y.[$id][4],
+    "spd"            : $y.[$id][5],
+    "squawk"         : $y.[$id][6],
+    "feeder_id"      : $y.[$id][7],
+    "aircraft_model" : $y.[$id][8],
+    "aircraft_reg"   : $y.[$id][9],
+    "timestamp"      : $y.[$id][10],
+    "airport_orig"   : $y.[$id][11],
+    "airport_dest"   : $y.[$id][12],
+    "flight_num"     : $y.[$id][13],
+    "on_ground"      : $y.[$id][14],
+    "vertical_speed" : $y.[$id][15],
+    "callsign"       : $y.[$id][16],
+    "airline_icao"   : $y.[$id][18]
+   })] as $flights
+|
+{
+"full_count": $x.full_count,
+"version": $x.version,
+$flights,
+"stats" : $x.stats,
+}
+' <<< "$brief"
+}
+
+show() {
+    local detail="$1"
+    local msg
+    local flightradar_link
+    local link_handle
+    local filter='
+    .aircraft.images.thumbnails[0].src + "\n" +
+    .airline.name + ", " +
+    .identification.number.default + "/" + .identification.callsign + "\n" +
+    "✈️ " + .aircraft.model.text + "\n" +
+    "↗️ " + .airport.origin.position.country.name + ", " +
+    .airport.origin.position.region.city + "\n" +
+    "↘️ " + .airport.destination.position.country.name + ", " +
+    .airport.destination.position.region.city + "\n" +
+    "📅 " + .status.text + "\n" +
+    "📏 " +
+    try ((.trail[0].alt * 0.0003048) | floor | tostring) catch ("?") + "km" +
+    ", " +
+    try ((.trail[0].spd * 1.8520000) | floor | tostring) catch ("?") + "km/h"
+    '
+    msg=$(jq -r "$filter" <<< "$detail")
+    # img_link of airplane body
+    local airplane_img_link
+    # title = airline_name + flight_number/flight_callsign
+    local title
+    { read -r airplane_img_link && read -r title; } <<< "$msg"
+    msg=$(tail -n+3 <<< "$msg")
+
+    link_handle=$(jq -r '.identification as $id
+                        | ($id.callsign + "/" + $id.id)' <<< "$detail")
+    flightradar_link="https://www.flightradar24.com/$link_handle"
+
+    printf "———————\n%s\n%s\n%s\n" "$title" "$msg" "$flightradar_link"
+
+    if [[ "$use_notify" == 1 ]]; then
+        local img_path
+        local ua="User-Agent: Mozilla/5.0 \
+(X11; Ubuntu; Linux x86_64; rv:84.0) Gecko/20100101 Firefox/84.0"
+        if [[ -n "$airplane_img_link" ]]; then
+            img_path=$(mktemp "$script_tmp_dir/img-XXX")
+            curl_opts=()
+            curl_opts+=(--header "$ua" --output "$img_path")
+            fetch "$airplane_img_link"
+        fi
+        [[ -z "$title" ]] && title=" "
+        notify-send "$title" "$msg\n$flightradar_link" \
+            --icon "$img_path" --expire-time 10000
+    fi
+}
+
+while getopts s:r:y:x:b:i:v:o:fnqVh name; do
+    case $name in
+        s)
+            query_str="$OPTARG"
+            ;;
+        r)
+            delta_deg="$OPTARG"
+            ;;
+        y)
+            latitude="$OPTARG"
+            ;;
+        x)
+            longitude="$OPTARG"
+            ;;
+        b)
+            bounds="$OPTARG"
+            custom_bounds=1
+            ;;
+        i)
+            flight_ids="$OPTARG"
+            ;;
+        v)
+            log_level="$OPTARG"
+            ;;
+        o)
+            details_file="$OPTARG"
+            brief_mode=0
+            ;;
+        f)
+            brief_mode=1
+            ;;
+        n)
+            use_notify=1
+            brief_mode=0
+            ;;
+        q)
+            log_level=0
+            ;;
+        V)
+            printf "%s\n" "$version"
+            exit 0
+            ;;
+        h)
+            print_help
+            exit 0
+            ;;
+        ?)
+            log error "Bad usage! Check -h"
+            exit 2
+            ;;
+    esac
+done
+
+# sanitization
+if ! sanitize; then
+    exit 2
+fi
+
+case $mode in
+    "scan_bounds")
+        if [[ -z "$custom_bounds" ]]; then
+            # creating bounds based on inputted city/(lat/lon) and delta_deg
+            if ! bounds=$(generate_bounds \
+                "$delta_deg" "$latitude" "$longitude"); then
+                log error "Problem in generating bounds. Check -h"
+                exit 2
+            fi
+            log info "Scan region for δ=$delta_deg°: $bounds"
+        else
+            # reforming the directly inputed bounds
+            bounds=$(printf "%s,%s,%s,%s\n" "$lat2" "$lat1" "$lon1" "$lon2")
+            log info "Scan region: $bounds"
+        fi
+
+        # get all flights in region defined by bounds
+        if ! flights=$(get_flights "$bounds"); then
+            exit 1
+        fi
+
+        # get only flights that are within the desired geographical region
+        # if [[ -z "$custom_bounds" ]]; then
+        #     filtered_flights=$(filter_flights "$flights" \
+        #         "$latitude" "$longitude" "$delta_deg")
+        # else
+        #     filtered_flights="$flights"
+        # fi
+        filtered_flights="$flights"
+
+        log debug "Flights brief info: $(jq -c . <<< "$filtered_flights")"
+
+        ;;
+    "direct-ids")
+        flight_ids="${flight_ids//[[:space:]]/}"
+        filtered_flights="{}"
+        old_ifs="$IFS"
+        IFS=","
+        for id in $flight_ids; do
+            flights_tmp=$(jq \
+                ". + {\"$id\" : []}" <<< "$filtered_flights")
+            filtered_flights="$flights_tmp"
+        done
+        IFS="$old_ifs"
+        ;;
+
+esac
+
+if [[ -n "$details_file" ]]; then
+    details_file_tmp=$(mktemp "$script_tmp_dir/details-XXX.json")
+    printf "" > "$details_file"
+fi
+
+# handle brief mode
+if ((brief_mode)); then
+    gen_brief "$filtered_flights"
+    exit
+fi
+
+# handle detailed mode
+# loop over `flight_id`s and print their info
+while read -r id; do
+    if ! detail=$(get_flight_details "$id"); then
+        log error "Problem getting details of flight_id: $id"
+        exit 1
+    fi
+
+    if [[ -n "$details_file" ]]; then
+        # append details json (one line) to details_file
+        jq --compact-output '.' <<< "$detail" >> "$details_file_tmp"
+    fi
+
+    # present the details of matched flight
+    show "$detail"
+
+done < <(jq -r 'del (.stats, .version, .full_count) | keys[]' \
+    <<< "$filtered_flights")
+
+# slurp the details_file as a single json array
+if [[ -n "$details_file" ]]; then
+    swap_tmp=$(mktemp "$script_tmp_dir/details_tmp-XXX")
+    cp "$details_file_tmp" "$swap_tmp"
+    jq --slurp '.' "$swap_tmp" > "$details_file_tmp"
+    cp "$details_file_tmp" "$details_file"
+fi
