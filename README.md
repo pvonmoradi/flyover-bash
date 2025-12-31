@@ -63,6 +63,9 @@ OPTIONS
         Use notification (implies 'detailed' mode)
       [-f]
         Set mode to 'brief', only print an augmented json
+      [-g]
+        Exclude GRND-type vehicles from presentation
+        (only applies to STDOUT and notifications of 'detailed' mode)
       [-v log_level]
         v = 0 : No logs. Equivalent to -q
         v = 1 : Set level to error
@@ -88,6 +91,7 @@ EXAMPLES
     flyover -s "深圳" -qf
     flyover -i "2b1abd2f,2b1cae23"
     flyover -b "43.58,58.72,46.58,61.72"
+    flyover -s "oslo" -g
 ```
 
 ## Scope
