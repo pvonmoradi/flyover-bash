@@ -16,13 +16,13 @@ latitude/longitude and δ°.
 
 
 ## Dependencies
-- `curl jq`
+- `curl jq bc`
 - `notify-send`: (optional)
 
 In a Debian-like distro, these can be installed with:
 
 ``` shell
-sudo apt install curl jq libnotify-bin
+sudo apt install curl jq bc libnotify-bin
 ```
 
 ## Usage

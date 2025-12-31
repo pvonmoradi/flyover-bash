@@ -5,10 +5,10 @@
 # License: MIT
 # Description: A simple client for flightradar24.com. Shows info of aircrafts
 #              flying overhead in a [latitude ± δ, longitude ± δ] vicinity
-# Dependencies: jq, curl, notify-send
+# Dependencies: jq, bc, curl, notify-send
 # Note: depends on 'nominatim.openstreetmap.org' for geolocation service
 
-version=0.23
+version=0.24
 log_level=3
 use_notify=0
 brief_mode=0
